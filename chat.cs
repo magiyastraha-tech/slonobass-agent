@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Media;
@@ -101,6 +102,7 @@ namespace OpenCodeChat
         private Button logBtn;
         private Button profileBtn;
         private Button serviceBtn;
+        private Button balanceBtn;
         private Button addModelBtn;
         private Button updateBtn;
         private bool updating = false;
@@ -145,6 +147,15 @@ namespace OpenCodeChat
         private string currentModelKey = "";
         private bool suppressModelSwitch = false;
 
+        // Проекты: подпапки внутри projects. «Без проекта» — сама папка
+        // projects, как было в прежних версиях программы.
+        private ComboBox projectBox;
+        private Button newProjectBtn;
+        private Button deleteProjectBtn;
+        private string currentProject = "";
+        private bool suppressProjectSwitch = false;
+        private const string NoProject = "Без проекта";
+
         // История, импортированная из чата другой модели. Добавляется
         // в текст следующего запроса один раз, чтобы движок её увидел.
         private string importContext = "";
@@ -164,7 +175,7 @@ namespace OpenCodeChat
         // Версия программы. Сравнивается с номером в теге релиза
         // slonobass-agent-N на GitHub, чтобы кнопка «Обновить программу»
         // знала, есть ли что скачивать.
-        internal const int AppVersion = 19;
+        internal const int AppVersion = 20;
         private const string ReleasesApi =
             "https://api.github.com/repos/magiyastraha-tech/slonobass-agent/releases?per_page=20";
 
@@ -213,7 +224,10 @@ namespace OpenCodeChat
             BuildUi();
             BuildMenus();
             modelBox.SelectedIndexChanged += ModelChanged;
+            projectBox.SelectedIndexChanged += ProjectChanged;
             PrepareChatStore();
+            RefreshProjects();
+            if (currentProject.Length > 0) WriteOfflineConfig();
             if (!LoadHistory()) StartChat(false);
 
             transcript.Font = bodyFont;
@@ -286,6 +300,38 @@ namespace OpenCodeChat
             modelBox.AccessibleDescription = "Список моделей. Сверху раздел «Мой профиль» — модели вашего аккаунта DeepSeek, ниже бесплатные модели.";
             header.Controls.Add(modelBox);
 
+            Label projectLabel = new Label();
+            projectLabel.Text = "Проект:";
+            projectLabel.AutoSize = true;
+            projectLabel.Padding = new Padding(0, 8, 4, 0);
+            header.Controls.Add(projectLabel);
+
+            projectBox = new ComboBox();
+            projectBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            projectBox.Width = 220;
+            projectBox.Margin = new Padding(0, 3, 6, 3);
+            projectBox.AccessibleName = "Проект";
+            projectBox.AccessibleDescription = "Проект — отдельная папка внутри папки projects. Агент работает только в папке выбранного проекта.";
+            header.Controls.Add(projectBox);
+
+            newProjectBtn = new Button();
+            newProjectBtn.Text = "Создать &проект…";
+            newProjectBtn.AutoSize = true;
+            newProjectBtn.Margin = new Padding(0, 3, 6, 3);
+            newProjectBtn.AccessibleName = "Создать проект";
+            newProjectBtn.AccessibleDescription = "Создаёт папку проекта внутри папки projects";
+            newProjectBtn.Click += delegate { CreateProject(); };
+            header.Controls.Add(newProjectBtn);
+
+            deleteProjectBtn = new Button();
+            deleteProjectBtn.Text = "&Удалить проект";
+            deleteProjectBtn.AutoSize = true;
+            deleteProjectBtn.Margin = new Padding(0, 3, 12, 3);
+            deleteProjectBtn.AccessibleName = "Удалить проект";
+            deleteProjectBtn.AccessibleDescription = "Удаляет папку выбранного проекта со всем содержимым";
+            deleteProjectBtn.Click += delegate { DeleteProject(); };
+            header.Controls.Add(deleteProjectBtn);
+
             addModelBtn = new Button();
             addModelBtn.Text = "&Добавить модель…";
             addModelBtn.AutoSize = true;
@@ -310,6 +356,14 @@ namespace OpenCodeChat
             serviceBtn.AccessibleDescription = "Polza.ai, AnyModel или свой адрес: ключ и список моделей";
             serviceBtn.Click += delegate { OpenOtherService(); };
             header.Controls.Add(serviceBtn);
+
+            balanceBtn = new Button();
+            balanceBtn.Text = "Проверить &баланс";
+            balanceBtn.AutoSize = true;
+            balanceBtn.AccessibleName = "Проверить баланс";
+            balanceBtn.AccessibleDescription = "Показывает баланс Polza.ai и AnyModel по сохранённым ключам";
+            balanceBtn.Click += delegate { CheckBalances(balanceBtn); };
+            header.Controls.Add(balanceBtn);
 
             newChatBtn = new Button();
             newChatBtn.Text = "&Новый разговор";
@@ -424,7 +478,7 @@ namespace OpenCodeChat
             buttons.Controls.Add(copyBtn);
 
             importBtn = new Button();
-            importBtn.Text = "&Импорт истории";
+            importBtn.Text = "&Импорт истории (Ctrl+I)";
             importBtn.Width = 200;
             importBtn.Height = 28;
             importBtn.AccessibleName = "Импорт истории";
@@ -507,7 +561,7 @@ namespace OpenCodeChat
                 Close();
                 return;
             }
-            Log.Write("START", "Движок: " + exePath + "; рабочая папка: " + projectsDir + "; Загрузки: " + downloadsDir
+            Log.Write("START", "Движок: " + exePath + "; рабочая папка: " + WorkDir + "; Загрузки: " + downloadsDir
                 + "; профиль DeepSeek: " + (Profile.HasKey ? "подключён " + Profile.Hint : "нет")
                 + "; другой сервис: " + (Service.HasProfile ? Service.Label + " " + Service.Hint : "нет"));
             if (Profile.HasKey && statusLabel.Text == "Готов") statusLabel.Text = "Готов. Мой профиль DeepSeek подключён: " + Profile.Hint;
@@ -591,7 +645,7 @@ namespace OpenCodeChat
                 // Если программа переехала в другую папку, движок не найдёт
                 // сессию по старому пути — начинаем разговор с новой сессии.
                 if (sessionId != null && savedDir != null
-                    && !string.Equals(NormalizeDir(savedDir), NormalizeDir(projectsDir), StringComparison.OrdinalIgnoreCase))
+                    && !string.Equals(NormalizeDir(savedDir), NormalizeDir(WorkDir), StringComparison.OrdinalIgnoreCase))
                 {
                     Log.Write("SESSION", "Сессия из другой папки отброшена: " + savedDir);
                     sessionId = null;
@@ -633,7 +687,7 @@ namespace OpenCodeChat
                 sb.AppendLine("session=" + (sessionId == null ? "" : sessionId));
                 sb.AppendLine("started=" + startedAt.ToString("yyyy-MM-dd HH:mm:ss"));
                 sb.AppendLine("model=" + (model == null ? "" : model));
-                sb.AppendLine("dir=" + projectsDir);
+                sb.AppendLine("dir=" + WorkDir);
                 File.WriteAllText(historyState, sb.ToString(), Encoding.UTF8);
                 if (model != null && model.Length > 0) preferredModel = model;
             }
@@ -660,6 +714,14 @@ namespace OpenCodeChat
                         string line = lines[i];
                         if (line.StartsWith("model=", StringComparison.Ordinal))
                             currentModelKey = line.Substring(6).Trim();
+                        else if (line.StartsWith("project=", StringComparison.Ordinal))
+                            currentProject = line.Substring(8).Trim();
+                    }
+                    if (currentProject.Length > 0
+                        && !Directory.Exists(Path.Combine(projectsDir, currentProject)))
+                    {
+                        Log.Write("PROJECT", "Папка прежнего проекта не найдена, открыт «Без проекта»: " + currentProject);
+                        currentProject = "";
                     }
                 }
                 else
@@ -690,12 +752,326 @@ namespace OpenCodeChat
                     }
                     SaveSettings();
                 }
-                if (currentModelKey.Length > 0) UseChatPaths(currentModelKey);
+                if (currentModelKey.Length > 0) UseChatPaths(ChatKeyOf(currentModelKey));
             }
             catch (Exception ex)
             {
                 Log.Write("ERROR", "Не удалось подготовить папку чатов: " + ex.Message);
             }
+        }
+
+        // Рабочая папка движка: папка выбранного проекта или сама projects.
+        private string WorkDir
+        {
+            get
+            {
+                return currentProject.Length == 0
+                    ? projectsDir
+                    : Path.Combine(projectsDir, currentProject);
+            }
+        }
+
+        // Ключ переписки: у каждой модели своя переписка в каждом проекте.
+        // Без проекта ключ совпадает с прежним — старые чаты остаются на месте.
+        private string ChatKeyOf(string modelKey)
+        {
+            if (modelKey == null || modelKey.Length == 0) return "";
+            return currentProject.Length == 0 ? modelKey : modelKey + "@" + currentProject;
+        }
+
+        private string ChatKey
+        {
+            get { return ChatKeyOf(currentModelKey); }
+        }
+
+        // ---------- проекты ----------
+
+        private void RefreshProjects()
+        {
+            if (projectBox == null) return;
+            suppressProjectSwitch = true;
+            try
+            {
+                projectBox.Items.Clear();
+                projectBox.Items.Add(NoProject);
+                string[] dirs = new string[0];
+                try
+                {
+                    dirs = Directory.GetDirectories(projectsDir);
+                }
+                catch
+                {
+                }
+                Array.Sort(dirs, StringComparer.CurrentCultureIgnoreCase);
+                for (int i = 0; i < dirs.Length; i++)
+                {
+                    string name = Path.GetFileName(dirs[i]);
+                    if (name.Length == 0 || name[0] == '.') continue;
+                    projectBox.Items.Add(name);
+                }
+                if (currentProject.Length > 0)
+                {
+                    for (int i = 1; i < projectBox.Items.Count; i++)
+                    {
+                        string item = projectBox.Items[i] as string;
+                        if (string.Equals(item, currentProject, StringComparison.OrdinalIgnoreCase))
+                        {
+                            currentProject = item;
+                            break;
+                        }
+                    }
+                }
+                SelectProject(currentProject);
+            }
+            finally
+            {
+                suppressProjectSwitch = false;
+            }
+        }
+
+        private void SelectProject(string name)
+        {
+            if (projectBox == null) return;
+            string want = name == null || name.Length == 0 ? NoProject : name;
+            for (int i = 0; i < projectBox.Items.Count; i++)
+            {
+                string item = projectBox.Items[i] as string;
+                if (string.Equals(item, want, StringComparison.OrdinalIgnoreCase))
+                {
+                    projectBox.SelectedIndex = i;
+                    return;
+                }
+            }
+            if (projectBox.Items.Count > 0) projectBox.SelectedIndex = 0;
+        }
+
+        private void ProjectChanged(object sender, EventArgs e)
+        {
+            if (suppressProjectSwitch) return;
+            string name = projectBox.SelectedItem as string;
+            if (name == null) return;
+            if (name == NoProject) name = "";
+            if (string.Equals(name, currentProject, StringComparison.Ordinal)) return;
+            if (busy)
+            {
+                suppressProjectSwitch = true;
+                SelectProject(currentProject);
+                suppressProjectSwitch = false;
+                statusLabel.Text = "Сейчас идёт ответ. Проект смените, когда агент закончит.";
+                return;
+            }
+            SwitchToProject(name, true);
+        }
+
+        // Смена проекта — это и смена рабочей папки, и новый разговор:
+        // сессия движка привязана к папке, чужая переписка в проект не тянется.
+        private void SwitchToProject(string name, bool announce)
+        {
+            SaveHistory();
+            currentProject = name == null ? "" : name;
+            UseChatPaths(ChatKey);
+            sessionId = null;
+            startedAt = DateTime.Now;
+            startedLabel.Text = "Разговор начат: " + startedAt.ToString("dd.MM.yyyy, HH:mm");
+            importContext = "";
+            importSource = "";
+            messages.Clear();
+            transcript.Items.Clear();
+            if (filesView != null) filesView.Items.Clear();
+            WriteOfflineConfig();
+            bool restored = LoadHistory();
+            if (!restored) StartChat(false);
+            SaveSettings();
+            Log.Write("PROJECT", "Проект: " + (currentProject.Length == 0 ? "(без проекта)" : currentProject)
+                + "; рабочая папка: " + WorkDir);
+            if (announce)
+            {
+                string where = currentProject.Length == 0 ? "Без проекта" : "Проект «" + currentProject + "»";
+                statusLabel.Text = restored
+                    ? where + ". Сообщений: " + messages.Count.ToString() + ". Рабочая папка: " + WorkDir
+                    : where + ". Новый разговор. Рабочая папка: " + WorkDir;
+            }
+        }
+
+        private void CreateProject()
+        {
+            string raw;
+            using (PromptForm dlg = new PromptForm("Новый проект",
+                "В папке projects появится папка с таким названием. Агент будет работать только в ней.",
+                "Название проекта"))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) { input.Focus(); return; }
+                raw = dlg.Value;
+            }
+            string name = MakeProjectName(raw);
+            if (name.Length == 0)
+            {
+                MessageBox.Show(this,
+                    "Название проекта пустое или содержит недопустимые символы.\r\n"
+                    + "Нельзя использовать: \\ / : * ? \" < > |",
+                    "Новый проект", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                input.Focus();
+                return;
+            }
+            string path = Path.Combine(projectsDir, name);
+            bool existed = Directory.Exists(path);
+            try
+            {
+                Directory.CreateDirectory(path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Не удалось создать папку проекта: " + ex.Message,
+                    "Новый проект", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            // На диске регистр может отличаться от введённого — берём имя
+            // папки как оно есть, иначе одна и та же папка даст два разных чата.
+            try
+            {
+                string[] dirs = Directory.GetDirectories(projectsDir);
+                for (int i = 0; i < dirs.Length; i++)
+                {
+                    string n = Path.GetFileName(dirs[i]);
+                    if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) { name = n; break; }
+                }
+            }
+            catch
+            {
+            }
+            Log.Write("PROJECT", (existed ? "Открыт существующий проект: " : "Создан проект: ") + name);
+            RefreshProjects();
+            suppressProjectSwitch = true;
+            SwitchToProject(name, false);
+            SelectProject(name);
+            suppressProjectSwitch = false;
+            statusLabel.Text = (existed
+                    ? "Проект «" + name + "» уже был — открыт. "
+                    : "Проект «" + name + "» создан. ")
+                + "Рабочая папка: " + WorkDir;
+            input.Focus();
+        }
+
+        private void DeleteProject()
+        {
+            if (currentProject.Length == 0)
+            {
+                statusLabel.Text = "Сначала выберите проект в списке.";
+                MessageBox.Show(this,
+                    "Выберите проект в списке. «Без проекта» — это сама папка projects, её удалить нельзя.",
+                    "Удалить проект", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                projectBox.Focus();
+                return;
+            }
+            string name = currentProject;
+            string path = Path.Combine(projectsDir, name);
+            int files = 0;
+            try
+            {
+                files = Directory.GetFiles(path, "*", SearchOption.AllDirectories).Length;
+            }
+            catch
+            {
+            }
+            DialogResult r = MessageBox.Show(this,
+                "Удалить проект «" + name + "» со всем содержимым?\r\n\r\n"
+                + "Папка: " + path + "\r\nФайлов внутри: " + files.ToString() + ".\r\n\r\n"
+                + "Это действие нельзя отменить.",
+                "Удалить проект", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (r != DialogResult.Yes) { input.Focus(); return; }
+
+            // Сначала выходим из проекта: движок не должен работать в папке,
+            // которую мы собираемся удалить.
+            suppressProjectSwitch = true;
+            SwitchToProject("", false);
+            suppressProjectSwitch = false;
+            try
+            {
+                Directory.Delete(path, true);
+                Log.Write("PROJECT", "Удалён проект: " + name + "; файлов: " + files.ToString());
+                statusLabel.Text = "Проект «" + name + "» удалён. Открыт «Без проекта».";
+            }
+            catch (Exception ex)
+            {
+                Log.Exception("Удаление проекта", ex);
+                statusLabel.Text = "Не удалось удалить проект: " + ex.Message;
+                MessageBox.Show(this, "Не удалось удалить папку проекта: " + ex.Message,
+                    "Удалить проект", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            RefreshProjects();
+            input.Focus();
+        }
+
+        private static string MakeProjectName(string raw)
+        {
+            if (raw == null) return "";
+            string name = raw.Trim();
+            if (name.Length == 0) return "";
+            if (name == "." || name == "..") return "";
+            char[] bad = Path.GetInvalidFileNameChars();
+            for (int i = 0; i < name.Length; i++)
+            {
+                for (int j = 0; j < bad.Length; j++)
+                {
+                    if (name[i] == bad[j]) return "";
+                }
+            }
+            if (name.Length > 80) name = name.Substring(0, 80).Trim();
+            return name;
+        }
+
+        // Проверка баланса обоих провайдеров: ключи берутся из сохранённых
+        // копий, поэтому активным сервисом может быть любой из них.
+        private void CheckBalances(Button btn)
+        {
+            if (busy)
+            {
+                statusLabel.Text = "Сейчас идёт ответ. Баланс проверю, когда агент закончит.";
+                return;
+            }
+            string polzaKey = Service.KeyFor("polza");
+            string anyKey = Service.KeyFor("anymodel");
+            if (polzaKey.Length == 0 && anyKey.Length == 0)
+            {
+                statusLabel.Text = "Ключи сервисов не сохранены.";
+                MessageBox.Show(this,
+                    "Ключи сервисов не сохранены.\r\n\r\n"
+                    + "Откройте «Другие сервисы…», выберите Polza.ai или AnyModel, вставьте ключ и сохраните. "
+                    + "Ключ запомнится, и баланс можно будет проверить в любой момент.",
+                    "Проверка баланса", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                input.Focus();
+                return;
+            }
+            btn.Enabled = false;
+            statusLabel.Text = "Проверяю баланс сервисов…";
+            Log.Write("BALANCE", "Запрос баланса: Polza.ai — "
+                + (polzaKey.Length > 0 ? "ключ сохранён" : "ключа нет")
+                + "; AnyModel — " + (anyKey.Length > 0 ? "ключ сохранён" : "ключа нет") + ".");
+            Thread t = new Thread(delegate()
+            {
+                string polza = BalanceInfo.Polza(polzaKey);
+                string any = BalanceInfo.Anymodel(anyKey);
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate { ShowBalances(btn, polza, any); });
+                }
+                catch
+                {
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void ShowBalances(Button btn, string polza, string any)
+        {
+            if (btn != null) btn.Enabled = true;
+            statusLabel.Text = polza + " " + any;
+            Log.Write("BALANCE", polza + " | " + any);
+            MessageBox.Show(this, polza + "\r\n\r\n" + any, "Баланс сервисов",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            input.Focus();
         }
 
         private static string SafeName(string key)
@@ -734,6 +1110,7 @@ namespace OpenCodeChat
             {
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("model=" + (currentModelKey == null ? "" : currentModelKey));
+                sb.AppendLine("project=" + currentProject);
                 File.WriteAllText(settingsFile, sb.ToString(), Encoding.UTF8);
             }
             catch (Exception ex)
@@ -804,7 +1181,7 @@ namespace OpenCodeChat
             if (currentModelKey.Length == 0) AdoptLegacy(key);
             currentModelKey = key;
             preferredModel = key;
-            UseChatPaths(key);
+            UseChatPaths(ChatKeyOf(key));
             sessionId = null;
             startedAt = DateTime.Now;
             startedLabel.Text = "Разговор начат: " + startedAt.ToString("dd.MM.yyyy, HH:mm");
@@ -895,21 +1272,29 @@ namespace OpenCodeChat
                 if (m == null) continue;
                 string key = KeyOf(m);
                 if (key.Length == 0 || string.Equals(key, currentModelKey, StringComparison.Ordinal)) continue;
-                string text = Path.Combine(chatsDir, SafeName(key) + ".txt");
-                int n = CountMessages(text);
-                if (n <= 0) continue;
+                string text = Path.Combine(chatsDir, SafeName(ChatKeyOf(key)) + ".txt");
+                bool dup = false;
+                for (int j = 0; j < paths.Count; j++)
+                {
+                    if (string.Equals(paths[j], text, StringComparison.OrdinalIgnoreCase)) { dup = true; break; }
+                }
+                if (dup) continue;
                 sources.Add(m);
-                counts.Add(n);
+                counts.Add(CountMessages(text));
                 paths.Add(text);
             }
-            Log.Write("IMPORT", "Чатов с историей помимо текущего: " + sources.Count.ToString()
-                + " (текущая модель: " + (currentModelKey.Length > 0 ? currentModelKey : "(нет)") + ").");
+            int withHistory = 0;
+            for (int i = 0; i < counts.Count; i++) if (counts[i] > 0) withHistory++;
+            Log.Write("IMPORT", "Других моделей в списке: " + sources.Count.ToString()
+                + "; из них с историей: " + withHistory.ToString()
+                + "; текущая модель: " + (currentModelKey.Length > 0 ? currentModelKey : "(нет)")
+                + "; проект: " + (currentProject.Length == 0 ? "(без проекта)" : currentProject) + ".");
             if (sources.Count == 0)
             {
-                statusLabel.Text = "Других чатов с историей нет.";
+                statusLabel.Text = "Других моделей в списке пока нет.";
                 MessageBox.Show(this,
-                    "Импортировать нечего: ни у одной другой модели пока нет переписки.\r\n"
-                    + "Поговорите с другой моделью — её чат сохранится, и его можно будет импортировать.",
+                    "Импортировать нечего: пока в списке только одна модель.\r\n"
+                    + "Переписка каждой модели — отдельный чат, и её можно добавить в текущий.",
                     "Импорт истории", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -924,14 +1309,19 @@ namespace OpenCodeChat
 
             ModelItem src = sources[chosen];
             List<MessageItem> list = ReadMessages(paths[chosen]);
+            string label = src.ToString();
             if (list.Count == 0)
             {
-                statusLabel.Text = "В выбранном чате нет сообщений.";
+                statusLabel.Text = "У чата «" + label + "» нет сообщений.";
+                MessageBox.Show(this,
+                    "У чата «" + label + "» пока нет сообщений — импортировать нечего.\r\n"
+                    + "Поговорите с этой моделью, и её переписку можно будет добавить сюда.",
+                    "Импорт истории", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 input.Focus();
                 return;
             }
 
-            string label = src.ToString();
+            int firstAdded = messages.Count;
             AddMessage("Импорт истории из чата «" + label + "»",
                 "Сообщений: " + list.Count.ToString() + ".", Color.FromArgb(0x1F, 0x3A, 0x5F));
             for (int i = 0; i < list.Count; i++)
@@ -964,7 +1354,7 @@ namespace OpenCodeChat
             importSource = label;
 
             SaveHistory();
-            transcript.SelectedIndex = messages.Count - 1;
+            if (firstAdded >= 0 && firstAdded < messages.Count) transcript.SelectedIndex = firstAdded;
             statusLabel.Text = "Импортировано сообщений: " + list.Count.ToString()
                 + " из чата «" + label + "». Агент учтёт их в следующем сообщении.";
             Log.Write("IMPORT", "Импорт из чата «" + label + "»: сообщений " + list.Count.ToString()
@@ -1027,7 +1417,8 @@ namespace OpenCodeChat
                 return;
             }
             DialogResult r = MessageBox.Show(this,
-                "Начать новый разговор? Переписка этой модели очистится, у других моделей свои чаты.",
+                "Начать новый разговор? Переписка этой модели в текущем проекте очистится, "
+                + "у других моделей и проектов свои чаты.",
                 "Новый разговор", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (r != DialogResult.Yes) return;
             StartChat(false);
@@ -1680,7 +2071,7 @@ namespace OpenCodeChat
                 {
                     ProcessStartInfo psi = new ProcessStartInfo(exePath);
                     psi.Arguments = BuildArgs(question, model, files, useSession);
-                    psi.WorkingDirectory = projectsDir;
+                    psi.WorkingDirectory = WorkDir;
                     psi.UseShellExecute = false;
                     psi.CreateNoWindow = true;
                     psi.RedirectStandardOutput = true;
@@ -2039,7 +2430,7 @@ namespace OpenCodeChat
             Dictionary<string, string> map = new Dictionary<string, string>();
             try
             {
-                string[] all = Directory.GetFiles(projectsDir, "*", SearchOption.AllDirectories);
+                string[] all = Directory.GetFiles(WorkDir, "*", SearchOption.AllDirectories);
                 for (int i = 0; i < all.Length; i++)
                 {
                     if (IsHiddenPath(all[i])) continue;
@@ -2062,9 +2453,9 @@ namespace OpenCodeChat
         private bool IsHiddenPath(string path)
         {
             string rel = path;
-            if (rel.StartsWith(projectsDir, StringComparison.OrdinalIgnoreCase))
+            if (rel.StartsWith(WorkDir, StringComparison.OrdinalIgnoreCase))
             {
-                rel = rel.Substring(projectsDir.Length);
+                rel = rel.Substring(WorkDir.Length);
             }
             string[] parts = rel.Split('\\', '/');
             for (int i = 0; i < parts.Length - 1; i++)
@@ -2272,7 +2663,7 @@ namespace OpenCodeChat
                 {
                     ProcessStartInfo psi = new ProcessStartInfo(exePath);
                     psi.Arguments = "models --standalone";
-                    psi.WorkingDirectory = projectsDir;
+                    psi.WorkingDirectory = WorkDir;
                     psi.UseShellExecute = false;
                     psi.CreateNoWindow = true;
                     psi.RedirectStandardOutput = true;
@@ -2582,7 +2973,7 @@ namespace OpenCodeChat
             int output = Math.Min(4096, Math.Max(1024, limitCtx / 2));
             try
             {
-                string path = Path.Combine(projectsDir, "opencode.json");
+                string path = Path.Combine(WorkDir, "opencode.json");
                 string url = "http://127.0.0.1:" + OfflinePort.ToString() + "/v1";
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("{");
@@ -2654,7 +3045,7 @@ namespace OpenCodeChat
             const string marker = "<!-- Slonobass agent -->";
             try
             {
-                string path = Path.Combine(projectsDir, "AGENTS.md");
+                string path = Path.Combine(WorkDir, "AGENTS.md");
                 if (File.Exists(path))
                 {
                     string head = "";
@@ -3418,6 +3809,77 @@ namespace OpenCodeChat
         }
     }
 
+    // Небольшой диалог с одной строкой ввода: имя нового проекта.
+    internal sealed class PromptForm : Form
+    {
+        private TextBox box;
+
+        public string Value
+        {
+            get { return box.Text.Trim(); }
+        }
+
+        public PromptForm(string title, string intro, string prompt)
+        {
+            Text = title;
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(520, 190);
+            Font = new Font("Segoe UI", 10f);
+
+            Label info = new Label();
+            info.Text = intro;
+            info.Location = new Point(14, 12);
+            info.Size = new Size(492, 52);
+            info.AccessibleName = "Описание";
+            Controls.Add(info);
+
+            Label cap = new Label();
+            cap.Text = prompt;
+            cap.Location = new Point(14, 70);
+            cap.Size = new Size(492, 22);
+            Controls.Add(cap);
+
+            box = new TextBox();
+            box.Location = new Point(14, 96);
+            box.Size = new Size(492, 26);
+            box.AccessibleName = prompt;
+            box.AccessibleDescription = "Введите название проекта и нажмите ОК.";
+            Controls.Add(box);
+
+            Button ok = new Button();
+            ok.Text = "&ОК";
+            ok.Location = new Point(14, 138);
+            ok.Size = new Size(120, 32);
+            ok.AccessibleName = "ОК";
+            ok.Click += delegate
+            {
+                if (box.Text.Trim().Length == 0)
+                {
+                    System.Media.SystemSounds.Beep.Play();
+                    box.Focus();
+                    return;
+                }
+                DialogResult = DialogResult.OK;
+            };
+            Controls.Add(ok);
+            AcceptButton = ok;
+
+            Button cancel = new Button();
+            cancel.Text = "От&мена";
+            cancel.Location = new Point(146, 138);
+            cancel.Size = new Size(120, 32);
+            cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancel);
+            CancelButton = cancel;
+
+            Shown += delegate { box.Focus(); };
+        }
+    }
+
     internal sealed class ImportItem
     {
         private readonly string label;
@@ -3431,7 +3893,9 @@ namespace OpenCodeChat
 
         public override string ToString()
         {
-            return label + " — сообщений: " + count.ToString();
+            return count > 0
+                ? label + " — сообщений: " + count.ToString()
+                : label + " — сообщений нет";
         }
     }
 
@@ -3439,6 +3903,8 @@ namespace OpenCodeChat
     {
         private ListBox list;
         private int selected = -1;
+        private List<int> counts;
+        private Label hint;
 
         public int SelectedIndex
         {
@@ -3456,9 +3922,12 @@ namespace OpenCodeChat
             ClientSize = new Size(660, 430);
             Font = new Font("Segoe UI", 10f);
 
+            this.counts = counts;
+
             Label intro = new Label();
             intro.Text = "Выберите чат другой модели. Его сообщения добавятся в текущий чат, "
-                + "и агент учтёт их в следующем ответе.";
+                + "и агент учтёт их в следующем ответе. В списке — все другие модели, "
+                + "даже если переписки у них пока нет.";
             intro.Location = new Point(14, 12);
             intro.Size = new Size(632, 46);
             intro.AccessibleName = "Описание";
@@ -3469,16 +3938,26 @@ namespace OpenCodeChat
             list.Size = new Size(632, 280);
             list.IntegralHeight = false;
             list.AccessibleName = "Чаты других моделей";
-            list.AccessibleDescription = "Список моделей с историей. Выберите строку стрелками и нажмите «Импортировать».";
+            list.AccessibleDescription = "Список моделей и числа сообщений в их чатах. Выберите строку стрелками и нажмите «Импортировать».";
             for (int i = 0; i < models.Count; i++)
             {
                 list.Items.Add(new ImportItem(models[i].ToString(), counts[i]));
             }
-            if (list.Items.Count > 0) list.SelectedIndex = 0;
-            list.DoubleClick += delegate
+            if (list.Items.Count > 0)
             {
-                selected = list.SelectedIndex;
-                if (selected >= 0) DialogResult = DialogResult.OK;
+                int first = 0;
+                for (int i = 0; i < counts.Count; i++)
+                {
+                    if (counts[i] > 0) { first = i; break; }
+                }
+                list.SelectedIndex = first;
+            }
+            list.DoubleClick += delegate { accepted(); };
+            list.SelectedIndexChanged += delegate
+            {
+                if (hint == null) return;
+                hint.ForeColor = SystemColors.ControlText;
+                hint.Text = "Enter — импортировать, Esc — отмена.";
             };
             Controls.Add(list);
 
@@ -3488,11 +3967,7 @@ namespace OpenCodeChat
             ok.Size = new Size(170, 32);
             ok.AccessibleName = "Импортировать историю выбранного чата";
             ok.AccessibleDescription = "Добавляет сообщения выбранного чата в текущий чат";
-            ok.Click += delegate
-            {
-                selected = list.SelectedIndex;
-                DialogResult = DialogResult.OK;
-            };
+            ok.Click += delegate { accepted(); };
             Controls.Add(ok);
             AcceptButton = ok;
 
@@ -3504,11 +3979,29 @@ namespace OpenCodeChat
             Controls.Add(cancel);
             CancelButton = cancel;
 
-            Label hint = new Label();
+            hint = new Label();
             hint.Text = "Enter — импортировать, Esc — отмена.";
             hint.Location = new Point(350, 362);
             hint.Size = new Size(296, 22);
+            hint.AccessibleName = "Подсказка";
             Controls.Add(hint);
+        }
+
+        // Строку без сообщений импортировать нельзя: подсказывает, что не так,
+        // и оставляет окно открытым — никакой молчаливой реакции.
+        private void accepted()
+        {
+            int i = list.SelectedIndex;
+            if (i < 0 || counts == null || i >= counts.Count) return;
+            if (counts[i] <= 0)
+            {
+                hint.ForeColor = Color.Firebrick;
+                hint.Text = "В этом чате нет сообщений. Выберите другой.";
+                System.Media.SystemSounds.Beep.Play();
+                return;
+            }
+            selected = i;
+            DialogResult = DialogResult.OK;
         }
     }
 
@@ -3689,6 +4182,7 @@ namespace OpenCodeChat
             {
                 Log.Exception("Сохранение другого сервиса", ex);
             }
+            RememberKey(baseUrl, key);
         }
 
         public static void Clear()
@@ -3713,6 +4207,61 @@ namespace OpenCodeChat
         {
             string k = Key;
             if (k.Length > 0) psi.EnvironmentVariables["POLZA_API_KEY"] = k;
+        }
+
+        // Ключи обоих известных сервисов хранятся по отдельности: активным
+        // может быть только один, а баланс нужно уметь проверять у обоих.
+        private static string ServicesDir { get { return Path.Combine(Dir, "services"); } }
+
+        public static string ProviderOf(string url)
+        {
+            if (url == null) return "";
+            string u = url.ToLowerInvariant();
+            if (u.Contains("polza")) return "polza";
+            if (u.Contains("anymodel")) return "anymodel";
+            return "";
+        }
+
+        private static void RememberKey(string url, string value)
+        {
+            string provider = ProviderOf(url);
+            if (provider.Length == 0 || value == null || value.Length == 0) return;
+            try
+            {
+                if (!Directory.Exists(ServicesDir)) Directory.CreateDirectory(ServicesDir);
+                byte[] data = Encoding.UTF8.GetBytes(value);
+                byte[] prot = ProtectedData.Protect(data, null, DataProtectionScope.CurrentUser);
+                File.WriteAllBytes(Path.Combine(ServicesDir, provider + ".key"), prot);
+            }
+            catch (Exception ex)
+            {
+                Log.Exception("Сохранение ключа сервиса", ex);
+            }
+        }
+
+        // Ключ провайдера: сохранённый ранее, иначе — активный ключ,
+        // если это тот же провайдер.
+        public static string KeyFor(string provider)
+        {
+            if (provider == null || provider.Length == 0) return "";
+            try
+            {
+                string path = Path.Combine(ServicesDir, provider + ".key");
+                if (File.Exists(path))
+                {
+                    byte[] prot = File.ReadAllBytes(path);
+                    byte[] data = ProtectedData.Unprotect(prot, null, DataProtectionScope.CurrentUser);
+                    string k = Encoding.UTF8.GetString(data).Trim();
+                    if (k.Length > 0) return k;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Exception("Чтение ключа сервиса", ex);
+            }
+            string active = ProviderOf(BaseUrl);
+            if (string.Equals(active, provider, StringComparison.OrdinalIgnoreCase)) return Key;
+            return "";
         }
 
         // Проверка ключа настоящим запросом к модели. Список моделей у многих
@@ -3819,6 +4368,147 @@ namespace OpenCodeChat
             {
                 Log.Exception("Чтение другого сервиса", ex);
             }
+        }
+    }
+
+    // Баланс сервисов: Polza.ai отдаёт сумму в рублях, AnyModel — остаток
+    // токенов. Оба запроса идут по сохранённым ключам провайдеров.
+    internal static class BalanceInfo
+    {
+        private static readonly CultureInfo Ru = CultureInfo.GetCultureInfo("ru-RU");
+
+        public static string Polza(string apiKey)
+        {
+            if (apiKey == null || apiKey.Length == 0)
+                return "Polza.ai: ключ не сохранён. Введите его в «Другие сервисы…» — ключ запомнится.";
+            string body, err = "";
+            bool ok = Get("https://polza.ai/api/v2/balance", apiKey, out body, out err);
+            string text = ok ? FormatPolza(body) : "";
+            if (text.Length > 0) return "Polza.ai: " + text;
+            string err2 = "";
+            ok = Get("https://polza.ai/api/v1/balance", apiKey, out body, out err2);
+            text = ok ? FormatPolza(body) : "";
+            if (text.Length > 0) return "Polza.ai: " + text;
+            string reason = err.Length > 0 ? err : err2;
+            return "Polza.ai: не удалось узнать баланс — "
+                + (reason.Length > 0 ? reason : "сервис не прислал сумму.");
+        }
+
+        public static string Anymodel(string apiKey)
+        {
+            if (apiKey == null || apiKey.Length == 0)
+                return "AnyModel: ключ не сохранён. Введите его в «Другие сервисы…» — ключ запомнится.";
+            string body, err;
+            if (!Get("https://anymodel.org/v1/balance", apiKey, out body, out err))
+                return "AnyModel: не удалось узнать баланс — " + err;
+            string unlimited = Text(body, "unlimited");
+            if (string.Equals(unlimited, "true", StringComparison.OrdinalIgnoreCase))
+                return "AnyModel: без ограничений.";
+            double balance = Num(body, "balance");
+            if (double.IsNaN(balance))
+                return "AnyModel: не удалось узнать баланс — сервис не прислал остаток.";
+            string res = "AnyModel: " + balance.ToString("N0", Ru) + " токенов";
+            string status = Text(body, "status");
+            if (status.Length > 0 && !string.Equals(status, "active", StringComparison.OrdinalIgnoreCase))
+                res += " (статус ключа: " + status + ")";
+            return res;
+        }
+
+        private static string FormatPolza(string body)
+        {
+            double available = Num(body, "available");
+            double amount = Num(body, "amount");
+            double spent = Num(body, "spentAmount");
+            if (double.IsNaN(available) && double.IsNaN(amount)) return "";
+            StringBuilder sb = new StringBuilder();
+            if (!double.IsNaN(available))
+            {
+                sb.Append("доступно ").Append(Money(available));
+                if (!double.IsNaN(amount)) sb.Append(" (на счёте ").Append(Money(amount));
+                if (!double.IsNaN(spent)) sb.Append(", потрачено ").Append(Money(spent));
+                if (!double.IsNaN(amount)) sb.Append(")");
+            }
+            else
+            {
+                sb.Append("на счёте ").Append(Money(amount));
+                if (!double.IsNaN(spent)) sb.Append(", потрачено ").Append(Money(spent));
+            }
+            return sb.ToString();
+        }
+
+        private static string Money(double value)
+        {
+            return value.ToString("N2", Ru) + " ₽";
+        }
+
+        private static bool Get(string url, string apiKey, out string body, out string err)
+        {
+            body = "";
+            err = "";
+            try
+            {
+                ServicePointManager.SecurityProtocol = ServicePointManager.SecurityProtocol
+                    | SecurityProtocolType.Tls12;
+            }
+            catch
+            {
+            }
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Proxy = null;
+                req.Method = "GET";
+                req.Accept = "application/json";
+                req.Timeout = 20000;
+                req.ReadWriteTimeout = 20000;
+                req.KeepAlive = false;
+                req.UserAgent = "SlonobassAgent";
+                req.Headers["Authorization"] = "Bearer " + apiKey;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    body = r.ReadToEnd();
+                    return true;
+                }
+            }
+            catch (WebException ex)
+            {
+                HttpWebResponse resp = ex.Response as HttpWebResponse;
+                if (resp == null)
+                {
+                    err = "нет связи с сервисом: " + ex.Message;
+                    return false;
+                }
+                int code = (int)resp.StatusCode;
+                if (code == 401 || code == 403) err = "ключ отклонён (код " + code.ToString() + ")";
+                else if (code == 402) err = "доступ к балансу закрыт (код 402)";
+                else if (code == 404) err = "адрес баланса не найден (код 404)";
+                else err = "сервис ответил кодом " + code.ToString();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                err = ex.Message;
+                return false;
+            }
+        }
+
+        private static double Num(string json, string field)
+        {
+            if (json == null || json.Length == 0) return double.NaN;
+            Match m = Regex.Match(json, "\"" + Regex.Escape(field) + "\"\\s*:\\s*\"?(-?[0-9]+(?:\\.[0-9]+)?)");
+            if (!m.Success) return double.NaN;
+            double v;
+            if (!double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                return double.NaN;
+            return v;
+        }
+
+        private static string Text(string json, string field)
+        {
+            if (json == null || json.Length == 0) return "";
+            Match m = Regex.Match(json, "\"" + Regex.Escape(field) + "\"\\s*:\\s*\"?([^\",}]*)");
+            return m.Success ? m.Groups[1].Value.Trim() : "";
         }
     }
 
