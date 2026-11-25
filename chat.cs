@@ -175,7 +175,7 @@ namespace OpenCodeChat
         // Версия программы. Сравнивается с номером в теге релиза
         // slonobass-agent-N на GitHub, чтобы кнопка «Обновить программу»
         // знала, есть ли что скачивать.
-        internal const int AppVersion = 20;
+        internal const int AppVersion = 21;
         private const string ReleasesApi =
             "https://api.github.com/repos/magiyastraha-tech/slonobass-agent/releases?per_page=20";
 
@@ -297,7 +297,7 @@ namespace OpenCodeChat
             modelBox.Width = 300;
             modelBox.Margin = new Padding(0, 3, 12, 3);
             modelBox.AccessibleName = "Модель";
-            modelBox.AccessibleDescription = "Список моделей. Сверху раздел «Мой профиль» — модели вашего аккаунта DeepSeek, ниже бесплатные модели.";
+            modelBox.AccessibleDescription = "Список моделей. Сверху раздел «Мой профиль» — модели вашего аккаунта DeepSeek, ниже бесплатные модели. F3 — перейти к списку моделей.";
             header.Controls.Add(modelBox);
 
             Label projectLabel = new Label();
@@ -311,7 +311,7 @@ namespace OpenCodeChat
             projectBox.Width = 220;
             projectBox.Margin = new Padding(0, 3, 6, 3);
             projectBox.AccessibleName = "Проект";
-            projectBox.AccessibleDescription = "Проект — отдельная папка внутри папки projects. Агент работает только в папке выбранного проекта.";
+            projectBox.AccessibleDescription = "Проект — отдельная папка внутри папки projects. Агент работает только в папке выбранного проекта. F4 — перейти к списку проектов.";
             header.Controls.Add(projectBox);
 
             newProjectBtn = new Button();
@@ -361,7 +361,7 @@ namespace OpenCodeChat
             balanceBtn.Text = "Проверить &баланс";
             balanceBtn.AutoSize = true;
             balanceBtn.AccessibleName = "Проверить баланс";
-            balanceBtn.AccessibleDescription = "Показывает баланс Polza.ai и AnyModel по сохранённым ключам";
+            balanceBtn.AccessibleDescription = "Alt+B: показывает баланс только того сервиса, чья модель выбрана сейчас — Polza.ai или AnyModel";
             balanceBtn.Click += delegate { CheckBalances(balanceBtn); };
             header.Controls.Add(balanceBtn);
 
@@ -478,11 +478,11 @@ namespace OpenCodeChat
             buttons.Controls.Add(copyBtn);
 
             importBtn = new Button();
-            importBtn.Text = "&Импорт истории (Ctrl+I)";
+            importBtn.Text = "&Импорт истории (Alt+I)";
             importBtn.Width = 200;
             importBtn.Height = 28;
             importBtn.AccessibleName = "Импорт истории";
-            importBtn.AccessibleDescription = "Ctrl+I: добавить в этот чат переписку из чата другой модели";
+            importBtn.AccessibleDescription = "Alt+I: добавить в этот чат переписку из чата другой модели";
             importBtn.Click += delegate { TriggerImport(); };
             buttons.Controls.Add(importBtn);
 
@@ -1021,8 +1021,10 @@ namespace OpenCodeChat
             return name;
         }
 
-        // Проверка баланса обоих провайдеров: ключи берутся из сохранённых
-        // копий, поэтому активным сервисом может быть любой из них.
+        // Баланс только того сервиса, чьей моделью работаем сейчас: у каждой
+        // модели в списке видно, откуда она. Модели other/ приходят из
+        // подключённого сервиса, остальные (бесплатные, свой DeepSeek,
+        // офлайн) баланс Polza.ai и AnyModel не тратят.
         private void CheckBalances(Button btn)
         {
             if (busy)
@@ -1030,31 +1032,70 @@ namespace OpenCodeChat
                 statusLabel.Text = "Сейчас идёт ответ. Баланс проверю, когда агент закончит.";
                 return;
             }
-            string polzaKey = Service.KeyFor("polza");
-            string anyKey = Service.KeyFor("anymodel");
-            if (polzaKey.Length == 0 && anyKey.Length == 0)
+
+            ModelItem mi = modelBox.SelectedItem as ModelItem;
+            string provider = "";
+            if (mi != null && mi.Id != null
+                && mi.Id.StartsWith("other/", StringComparison.OrdinalIgnoreCase)
+                && Service.HasProfile)
             {
-                statusLabel.Text = "Ключи сервисов не сохранены.";
-                MessageBox.Show(this,
-                    "Ключи сервисов не сохранены.\r\n\r\n"
-                    + "Откройте «Другие сервисы…», выберите Polza.ai или AnyModel, вставьте ключ и сохраните. "
-                    + "Ключ запомнится, и баланс можно будет проверить в любой момент.",
-                    "Проверка баланса", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                provider = Service.ProviderOf(Service.BaseUrl);
+            }
+
+            if (provider.Length == 0)
+            {
+                string text;
+                if (mi == null)
+                {
+                    text = "Модель не выбрана. Баланс показывается только у сервиса, чья модель выбрана: выберите модель Polza.ai или AnyModel.";
+                }
+                else if (mi.Offline)
+                {
+                    text = "Выбрана офлайн-модель — она работает на этом компьютере и баланс сервисов не тратит. Чтобы увидеть баланс, выберите модель Polza.ai или AnyModel.";
+                }
+                else if (mi.Id != null && mi.Id.StartsWith("deepseek/", StringComparison.OrdinalIgnoreCase))
+                {
+                    text = "Выбрана модель вашего профиля DeepSeek — запросы тратят токены аккаунта DeepSeek, а не Polza.ai или AnyModel. Баланс DeepSeek показан на его сайте, в разделе ключей.";
+                }
+                else if (mi.Id != null && mi.Id.StartsWith("other/", StringComparison.OrdinalIgnoreCase))
+                {
+                    text = "Модель подключена через сервис «" + Service.Label + "» с адресом " + Service.BaseUrl
+                        + " — баланс этого адреса программа не знает. Баланс можно проверить у Polza.ai и AnyModel.";
+                }
+                else
+                {
+                    text = "Выбрана бесплатная модель — она баланс сервисов не тратит. Чтобы увидеть баланс, выберите модель Polza.ai или AnyModel.";
+                }
+                statusLabel.Text = text;
+                MessageBox.Show(this, text, "Проверка баланса",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
                 input.Focus();
                 return;
             }
+
+            string providerName = provider == "polza" ? "Polza.ai" : "AnyModel";
+            string key = Service.KeyFor(provider);
+            if (key.Length == 0)
+            {
+                string missing = "Ключ " + providerName + " не сохранён."
+                    + "\r\n\r\nОткройте «Другие сервисы…», выберите " + providerName
+                    + ", вставьте ключ и сохраните — ключ запомнится, и баланс можно будет проверить в любой момент.";
+                statusLabel.Text = "Ключ " + providerName + " не сохранён.";
+                MessageBox.Show(this, missing, "Проверка баланса",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                input.Focus();
+                return;
+            }
+
             btn.Enabled = false;
-            statusLabel.Text = "Проверяю баланс сервисов…";
-            Log.Write("BALANCE", "Запрос баланса: Polza.ai — "
-                + (polzaKey.Length > 0 ? "ключ сохранён" : "ключа нет")
-                + "; AnyModel — " + (anyKey.Length > 0 ? "ключ сохранён" : "ключа нет") + ".");
+            statusLabel.Text = "Проверяю баланс: " + providerName + "…";
+            Log.Write("BALANCE", "Запрос баланса: " + providerName + " (модель " + mi.Id + ").");
             Thread t = new Thread(delegate()
             {
-                string polza = BalanceInfo.Polza(polzaKey);
-                string any = BalanceInfo.Anymodel(anyKey);
+                string result = provider == "polza" ? BalanceInfo.Polza(key) : BalanceInfo.Anymodel(key);
                 try
                 {
-                    BeginInvoke((MethodInvoker)delegate { ShowBalances(btn, polza, any); });
+                    BeginInvoke((MethodInvoker)delegate { ShowBalances(btn, result); });
                 }
                 catch
                 {
@@ -1064,12 +1105,12 @@ namespace OpenCodeChat
             t.Start();
         }
 
-        private void ShowBalances(Button btn, string polza, string any)
+        private void ShowBalances(Button btn, string result)
         {
             if (btn != null) btn.Enabled = true;
-            statusLabel.Text = polza + " " + any;
-            Log.Write("BALANCE", polza + " | " + any);
-            MessageBox.Show(this, polza + "\r\n\r\n" + any, "Баланс сервисов",
+            statusLabel.Text = result;
+            Log.Write("BALANCE", result);
+            MessageBox.Show(this, result, "Баланс сервиса",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             input.Focus();
         }
@@ -1260,7 +1301,7 @@ namespace OpenCodeChat
             }
         }
 
-        // Ctrl+I: выбрать чат другой модели и добавить его сообщения в текущий.
+        // Alt+I: выбрать чат другой модели и добавить его сообщения в текущий.
         private void ImportHistory()
         {
             List<ModelItem> sources = new List<ModelItem>();
@@ -1767,17 +1808,34 @@ namespace OpenCodeChat
 
         // ---------- hotkeys ----------
 
-        // Ctrl+I ловим на уровне формы, раньше поля ввода: в части раскладок
-        // и под программами экранного доступа сочетание доходит как Ctrl+Tab
-        // (оба дают символ табуляции), и до KeyDown оно уже не добирается.
+        // Сочетания с Alt ловим на уровне формы, раньше поля ввода и кнопок:
+        // так они не зависят от того, где стоит фокус, и не уходят в мнемоники.
+        // Ctrl+I оставлен запасным: в части раскладок и под программами
+        // экранного доступа он доходит как Ctrl+Tab (оба дают табуляцию).
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             bool ctrl = (keyData & Keys.Control) == Keys.Control;
-            bool altShift = (keyData & (Keys.Alt | Keys.Shift)) != Keys.None;
+            bool alt = (keyData & Keys.Alt) == Keys.Alt;
+            bool shift = (keyData & Keys.Shift) == Keys.Shift;
             Keys code = keyData & Keys.KeyCode;
-            if (ctrl && !altShift && (code == Keys.I || code == Keys.Tab))
+            if (alt && !ctrl && !shift && code == Keys.I)
             {
-                TriggerImport();
+                ImportHotkey("Alt+I");
+                return true;
+            }
+            if (alt && !ctrl && !shift && code == Keys.A)
+            {
+                AttachHotkey();
+                return true;
+            }
+            if (alt && !ctrl && !shift && code == Keys.B)
+            {
+                CheckBalances(balanceBtn);
+                return true;
+            }
+            if (ctrl && !alt && !shift && (code == Keys.I || code == Keys.Tab))
+            {
+                ImportHotkey("Ctrl+I");
                 return true;
             }
             return base.ProcessCmdKey(ref msg, keyData);
@@ -1785,13 +1843,35 @@ namespace OpenCodeChat
 
         private void TriggerImport()
         {
-            Log.Write("HOTKEY", "Нажато Ctrl+I: импорт истории.");
+            Log.Write("HOTKEY", "Нажата кнопка «Импорт истории».");
+            StartImport();
+        }
+
+        private void ImportHotkey(string combo)
+        {
+            Log.Write("HOTKEY", "Нажато " + combo + ": импорт истории.");
+            StartImport();
+        }
+
+        private void StartImport()
+        {
             if (busy)
             {
                 statusLabel.Text = "Сейчас идёт ответ. Импорт — после ответа.";
                 return;
             }
             ImportHistory();
+        }
+
+        private void AttachHotkey()
+        {
+            Log.Write("HOTKEY", "Нажато Alt+A: прикрепить файл.");
+            if (busy)
+            {
+                statusLabel.Text = "Сейчас идёт ответ. Дождитесь его, потом прикрепите файл.";
+                return;
+            }
+            AttachFiles();
         }
 
         private void FormKeyDown(object sender, KeyEventArgs e)
@@ -1819,6 +1899,16 @@ namespace OpenCodeChat
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 modelBox.Focus();
+                statusLabel.Text = "Список моделей. Стрелками выберите модель.";
+            }
+            else if (e.KeyCode == Keys.F4)
+            {
+                // Если фокус уже в списке проектов, F4 отдаём списку —
+                // он сам раскрывает перечень проектов.
+                if (projectBox != null && projectBox.Focused) return;
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                FocusProjects();
             }
             else if (e.Control && e.KeyCode == Keys.E)
             {
@@ -1832,23 +1922,16 @@ namespace OpenCodeChat
                 e.SuppressKeyPress = true;
                 NewChat();
             }
-            else if (e.Control && e.KeyCode == Keys.I)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                TriggerImport();
-            }
-            else if (e.Alt && e.KeyCode == Keys.F)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                if (busy)
-                {
-                    statusLabel.Text = "Сейчас идёт ответ. Дождитесь его, потом прикрепите файл.";
-                    return;
-                }
-                AttachFiles();
-            }
+        }
+
+        private void FocusProjects()
+        {
+            if (projectBox == null) return;
+            projectBox.Focus();
+            string cur = projectBox.SelectedItem == null
+                ? "Без проекта"
+                : projectBox.SelectedItem.ToString();
+            statusLabel.Text = "Проект: " + cur + ". Стрелками выберите проект, F4 — открыть список.";
         }
 
         private void FocusLastMessage()
@@ -2827,7 +2910,7 @@ namespace OpenCodeChat
                 desc.Append("Раздел «" + serviceLabel + "» — модели другого сервиса (" + others.Count.ToString() + "). ");
             desc.Append("Ниже бесплатные модели. Кнопка «Добавить модель» добавляет файл .gguf. "
                 + "У каждой модели свой чат: при смене модели открывается её переписка. "
-                + "Ctrl+I — импорт истории из чата другой модели.");
+                + "Alt+I — импорт истории из чата другой модели.");
             modelBox.AccessibleDescription = desc.ToString();
 
             AlignChatToSelection(true);
