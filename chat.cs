@@ -175,7 +175,7 @@ namespace OpenCodeChat
         // Версия программы. Сравнивается с номером в теге релиза
         // slonobass-agent-N на GitHub, чтобы кнопка «Обновить программу»
         // знала, есть ли что скачивать.
-        internal const int AppVersion = 21;
+        internal const int AppVersion = 22;
         private const string ReleasesApi =
             "https://api.github.com/repos/magiyastraha-tech/slonobass-agent/releases?per_page=20";
 
@@ -2127,7 +2127,9 @@ namespace OpenCodeChat
                     return;
                 }
             }
-            RunAgent(question, model, files, before);
+            List<FileItem> engineFiles;
+            question = PrepareAttachments(question, files, out engineFiles);
+            RunAgent(question, model, engineFiles, before);
         }
 
         private void RunAgent(string question, string model, List<FileItem> files, Dictionary<string, string> before)
@@ -2504,6 +2506,529 @@ namespace OpenCodeChat
             if (m10 == 1 && m100 != 11) return "файл";
             if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "файла";
             return "файлов";
+        }
+
+        // ---------- attachment preparation ----------
+        //
+        // Движку нельзя отдать любой файл как есть: ZIP, DOCX, PDF и прочие
+        // двоичные форматы он либо не читает, либо молча пропускает. Поэтому
+        // программа сама разбирает вложения: текст и картинки передаёт движку,
+        // ZIP распаковывает в папку проекта, из документов Office извлекает
+        // текст, а про остальное честно пишет модели, что содержимое недоступно.
+
+        private static readonly string[] TextExtensions = new string[]
+        {
+            ".txt", ".text", ".md", ".markdown", ".log", ".csv", ".tsv", ".json", ".jsonc",
+            ".xml", ".yml", ".yaml", ".ini", ".cfg", ".conf", ".config", ".toml",
+            ".cs", ".cpp", ".c", ".h", ".hpp", ".js", ".mjs", ".ts", ".jsx", ".tsx",
+            ".py", ".java", ".kt", ".go", ".rs", ".rb", ".php", ".html", ".htm", ".css",
+            ".scss", ".less", ".sh", ".bash", ".bat", ".cmd", ".ps1", ".sql", ".lua",
+            ".swift", ".m", ".mm", ".r", ".pl", ".vue", ".svelte", ".tex", ".rst", ".rtf",
+            ".patch", ".diff", ".csproj", ".sln", ".props", ".targets", ".gradle",
+            ".cmake", ".mk", ".gitignore", ".gitattributes", ".editorconfig", ".map"
+        };
+
+        private static readonly string[] ImageExtensions = new string[]
+        {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico"
+        };
+
+        private string PrepareAttachments(string question, List<FileItem> files, out List<FileItem> engineFiles)
+        {
+            engineFiles = new List<FileItem>();
+            if (files == null || files.Count == 0) return question;
+
+            SetStatusSafe("Готовлю вложения…");
+            string staging = MakeStagingDir();
+            StringBuilder man = new StringBuilder();
+            man.Append("\r\n\r\n--- Вложенные файлы ---\r\n");
+            man.Append("К сообщению приложены файлы. Что программа с каждым сделала — ниже. ");
+            man.Append("Если файл не удалось открыть или его формат тебе недоступен, прямо скажи, ");
+            man.Append("с каким файлом и почему не можешь работать. Не выдумывай содержимое файла.\r\n");
+
+            for (int i = 0; i < files.Count; i++)
+            {
+                FileItem f = files[i];
+                string line;
+                try
+                {
+                    line = DescribeAttachment(f, staging, engineFiles);
+                }
+                catch (Exception ex)
+                {
+                    Log.Exception("Вложение «" + (f == null ? "?" : f.Name) + "»", ex);
+                    line = "не удалось обработать: " + ex.Message + ". Путь: " + (f == null ? "?" : f.Path) + ".";
+                }
+                man.Append((i + 1).ToString()).Append(") ").Append(line).Append("\r\n");
+                Log.Write("ATTACH", (f == null ? "?" : f.Name) + ": " + line.Replace("\r\n", " "));
+            }
+            return question + man.ToString();
+        }
+
+        private string DescribeAttachment(FileItem f, string staging, List<FileItem> engineFiles)
+        {
+            if (f == null) return "пустая запись о файле, содержимое неизвестно.";
+            string path = f.Path;
+            if (path == null || path.Length == 0 || !File.Exists(path))
+            {
+                return "\"" + f.Name + "\" — файл не найден по пути «" + path
+                    + "». Скажи пользователю, что файл пропал или был перемещён.";
+            }
+
+            string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            string size = SizeText(f.Size);
+
+            if (IsImageFile(ext))
+            {
+                engineFiles.Add(f);
+                return "\"" + f.Name + "\" (" + size + ", изображение) — передано движку как картинка. "
+                    + "Если выбранная модель не умеет смотреть изображения, так и скажи.";
+            }
+
+            if (ext == ".zip")
+            {
+                return DescribeZip(f, staging);
+            }
+
+            if (IsOfficeDocument(ext))
+            {
+                string txt = ExtractOfficeText(path, ext, staging);
+                if (txt != null)
+                {
+                    FileItem ti = MakeItem(txt);
+                    engineFiles.Add(ti);
+                    return "\"" + f.Name + "\" (" + size + ", документ " + ext + ") — программа извлекла из него текст "
+                        + "в файл «" + ti.Name + "», он передан движку как текст. Если текст пустой или обрывками, "
+                        + "скажи, что документ прочитан не полностью.";
+                }
+                return "\"" + f.Name + "\" (" + size + ", документ " + ext + ") — прочитать не удалось. Путь: " + path
+                    + ". Скажи, что этот документ тебе недоступен.";
+            }
+
+            if (IsPdf(ext))
+            {
+                return "\"" + f.Name + "\" (" + size + ", PDF) — программа читать PDF не умеет, передан только путь: "
+                    + path + ". Если твои инструменты не открывают PDF, честно скажи, что не можешь его прочитать.";
+            }
+
+            if (IsUnsupportedArchive(ext))
+            {
+                return "\"" + f.Name + "\" (" + size + ", архив " + ext + ") — программа распаковывает только ZIP. "
+                    + "Путь: " + path + ". Если сам открыть не можешь, скажи, что формат архива тебе недоступен.";
+            }
+
+            if (LooksLikeText(path))
+            {
+                engineFiles.Add(f);
+                return "\"" + f.Name + "\" (" + size + ", текст) — передан движку как текст. "
+                    + "Путь на случай, если понадобится открыть самому: " + path + ".";
+            }
+
+            return "\"" + f.Name + "\" (" + size + ", двоичный файл) — содержимое движку не передавалось, "
+                + "только путь: " + path + ". Если формат тебе недоступен, прямо скажи, что с этим файлом работать не можешь.";
+        }
+
+        private string DescribeZip(FileItem f, string staging)
+        {
+            if (staging == null || staging.Length == 0)
+            {
+                return "\"" + f.Name + "\" (" + SizeText(f.Size) + ", архив ZIP) — программе не удалось создать папку "
+                    + "для распаковки. Путь: " + f.Path + ". Скажи, что архив прочитать не получается.";
+            }
+
+            string baseName = DirSafe(Path.GetFileNameWithoutExtension(f.Name));
+            string dest = Path.Combine(staging, baseName);
+            int n = 2;
+            while (Directory.Exists(dest))
+            {
+                dest = Path.Combine(staging, baseName + "-" + n.ToString());
+                n++;
+            }
+
+            int fileCount = 0;
+            int dirCount = 0;
+            int skipped = 0;
+            StringBuilder list = new StringBuilder();
+            try
+            {
+                Directory.CreateDirectory(dest);
+                using (ZipArchive a = ZipFile.OpenRead(f.Path))
+                {
+                    long total = 0;
+                    for (int i = 0; i < a.Entries.Count; i++)
+                    {
+                        ZipArchiveEntry e = a.Entries[i];
+                        string name = e.FullName.Replace('/', '\\');
+                        if (HasDotDotSegment(name)) { skipped++; continue; }
+                        if (fileCount >= 5000 || total > 300L * 1024 * 1024) { skipped++; break; }
+                        string destFull = Path.GetFullPath(dest);
+                        if (!destFull.EndsWith("\\", StringComparison.Ordinal)) destFull += "\\";
+                        string target = Path.GetFullPath(Path.Combine(dest, name));
+                        if (!target.StartsWith(destFull, StringComparison.OrdinalIgnoreCase)) { skipped++; continue; }
+                        if (name.EndsWith("\\", StringComparison.Ordinal))
+                        {
+                            Directory.CreateDirectory(target);
+                            dirCount++;
+                            continue;
+                        }
+                        string parent = Path.GetDirectoryName(target);
+                        if (parent != null && parent.Length > 0) Directory.CreateDirectory(parent);
+                        e.ExtractToFile(target, true);
+                        fileCount++;
+                        total += e.Length;
+                        if (list.Length < 2500) list.Append(name).Append("; ");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Exception("Распаковка архива «" + f.Name + "»", ex);
+                return "\"" + f.Name + "\" (" + SizeText(f.Size) + ", архив ZIP) — распаковать не удалось: "
+                    + ex.Message + ". Путь: " + f.Path + ". Скажи, что архив прочитать не получается.";
+            }
+
+            if (fileCount == 0)
+            {
+                return "\"" + f.Name + "\" (" + SizeText(f.Size) + ", архив ZIP) — архив пуст или в нём только папки. "
+                    + "Путь: " + f.Path + ".";
+            }
+
+            StringBuilder res = new StringBuilder();
+            res.Append("\"").Append(f.Name).Append("\" (").Append(SizeText(f.Size))
+               .Append(", архив ZIP) — программа распаковала его в папку ").Append(dest)
+               .Append(": ").Append(fileCount.ToString()).Append(' ').Append(FilesWord(fileCount));
+            if (dirCount > 0) res.Append(", папок: ").Append(dirCount.ToString());
+            if (skipped > 0) res.Append(", пропущено записей: ").Append(skipped.ToString());
+            res.Append(". Содержимое: ").Append(list.ToString());
+            if (list.Length >= 2500) res.Append("… (список обрезан)");
+            res.Append(" Нужный файл из архива открой по этому пути.");
+            return res.ToString();
+        }
+
+        private string ExtractOfficeText(string path, string ext, string staging)
+        {
+            if (staging == null || staging.Length == 0) return null;
+            try
+            {
+                string text = null;
+                using (ZipArchive a = ZipFile.OpenRead(path))
+                {
+                    if (ext == ".docx" || ext == ".docm")
+                    {
+                        string xml = ReadZipEntry(a, "word/document.xml");
+                        if (xml != null) text = WordXmlText(xml);
+                    }
+                    else if (ext == ".pptx" || ext == ".pptm")
+                    {
+                        text = PptxText(a);
+                    }
+                    else if (ext == ".xlsx" || ext == ".xlsm")
+                    {
+                        text = XlsxText(a);
+                    }
+                    else
+                    {
+                        string xml = ReadZipEntry(a, "content.xml");
+                        if (xml != null) text = XmlText(xml);
+                    }
+                }
+                if (text == null) return null;
+                text = text.Trim();
+                if (text.Length == 0) text = "(текст в документе не найден)";
+
+                string outPath = Path.Combine(staging, DirSafe(Path.GetFileName(path)) + ".txt");
+                int n = 2;
+                while (File.Exists(outPath))
+                {
+                    outPath = Path.Combine(staging, DirSafe(Path.GetFileName(path)) + "-" + n.ToString() + ".txt");
+                    n++;
+                }
+                File.WriteAllText(outPath, text, new UTF8Encoding(false));
+                return outPath;
+            }
+            catch (Exception ex)
+            {
+                Log.Exception("Чтение документа «" + Path.GetFileName(path) + "»", ex);
+                return null;
+            }
+        }
+
+        private static string ReadZipEntry(ZipArchive a, string name)
+        {
+            for (int i = 0; i < a.Entries.Count; i++)
+            {
+                if (string.Equals(a.Entries[i].FullName, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    using (Stream s = a.Entries[i].Open())
+                    using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+                    {
+                        return r.ReadToEnd();
+                    }
+                }
+            }
+            return null;
+        }
+
+        private static string WordXmlText(string xml)
+        {
+            xml = xml.Replace("</w:p>", "\n");
+            xml = xml.Replace("<w:tab/>", "\t");
+            xml = xml.Replace("<w:tab />", "\t");
+            xml = xml.Replace("<w:br/>", "\n");
+            xml = xml.Replace("<w:br />", "\n");
+            return XmlText(xml);
+        }
+
+        private static string XmlText(string xml)
+        {
+            string plain = Regex.Replace(xml, "<[^>]+>", "");
+            plain = System.Net.WebUtility.HtmlDecode(plain);
+            plain = plain.Replace("\r\n", "\n").Replace('\r', '\n');
+            plain = Regex.Replace(plain, "[ \t]+\n", "\n");
+            plain = Regex.Replace(plain, "\n{3,}", "\n\n");
+            return plain;
+        }
+
+        private static string PptxText(ZipArchive a)
+        {
+            List<string> names = new List<string>();
+            List<int> nums = new List<int>();
+            for (int i = 0; i < a.Entries.Count; i++)
+            {
+                string nm = a.Entries[i].FullName;
+                if (nm.StartsWith("ppt/slides/slide", StringComparison.OrdinalIgnoreCase)
+                    && nm.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                {
+                    string digits = Regex.Replace(nm, "[^0-9]", "");
+                    int v;
+                    names.Add(nm);
+                    nums.Add(int.TryParse(digits, out v) ? v : 0);
+                }
+            }
+            for (int i = 0; i < names.Count - 1; i++)
+            {
+                for (int j = i + 1; j < names.Count; j++)
+                {
+                    if (nums[j] < nums[i])
+                    {
+                        int tn = nums[i]; nums[i] = nums[j]; nums[j] = tn;
+                        string ts = names[i]; names[i] = names[j]; names[j] = ts;
+                    }
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < names.Count; i++)
+            {
+                string xml = ReadZipEntry(a, names[i]);
+                if (xml == null) continue;
+                xml = xml.Replace("</a:p>", "\n");
+                sb.Append("Слайд ").Append((i + 1).ToString()).Append(":\n");
+                sb.Append(XmlText(xml)).Append('\n');
+            }
+            return sb.ToString();
+        }
+
+        private static string XlsxText(ZipArchive a)
+        {
+            List<string> shared = new List<string>();
+            string ss = ReadZipEntry(a, "xl/sharedStrings.xml");
+            if (ss != null)
+            {
+                MatchCollection ms = Regex.Matches(ss, "<si[^>]*>(.*?)</si>", RegexOptions.Singleline);
+                for (int i = 0; i < ms.Count; i++)
+                {
+                    shared.Add(XmlText(ms[i].Groups[1].Value).Replace("\n", " ").Trim());
+                }
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (int s = 1; s < 200; s++)
+            {
+                string xml = ReadZipEntry(a, "xl/worksheets/sheet" + s.ToString() + ".xml");
+                if (xml == null) break;
+                sb.Append("Лист ").Append(s.ToString()).Append(":\n");
+                MatchCollection rows = Regex.Matches(xml, "<row[^>]*>(.*?)</row>", RegexOptions.Singleline);
+                for (int r = 0; r < rows.Count; r++)
+                {
+                    MatchCollection cells = Regex.Matches(rows[r].Groups[1].Value, "<c([^>]*)>(.*?)</c>", RegexOptions.Singleline);
+                    StringBuilder line = new StringBuilder();
+                    for (int c = 0; c < cells.Count; c++)
+                    {
+                        string attrs = cells[c].Groups[1].Value;
+                        string body = cells[c].Groups[2].Value;
+                        string val = "";
+                        Match v = Regex.Match(body, "<v>(.*?)</v>", RegexOptions.Singleline);
+                        if (v.Success)
+                        {
+                            val = v.Groups[1].Value;
+                            if (attrs.IndexOf("t=\"s\"", StringComparison.Ordinal) >= 0)
+                            {
+                                int idx;
+                                if (int.TryParse(val, out idx) && idx >= 0 && idx < shared.Count) val = shared[idx];
+                            }
+                        }
+                        else
+                        {
+                            Match inline = Regex.Match(body, "<t[^>]*>(.*?)</t>", RegexOptions.Singleline);
+                            if (inline.Success) val = System.Net.WebUtility.HtmlDecode(inline.Groups[1].Value);
+                        }
+                        if (c > 0) line.Append('\t');
+                        line.Append(val);
+                    }
+                    sb.Append(line.ToString().TrimEnd()).Append('\n');
+                }
+                sb.Append('\n');
+            }
+            return sb.ToString();
+        }
+
+        private static bool HasDotDotSegment(string name)
+        {
+            string[] parts = name.Split('\\', '/');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (parts[i] == "..") return true;
+            }
+            return false;
+        }
+
+        private static bool IsImageFile(string ext)
+        {
+            for (int i = 0; i < ImageExtensions.Length; i++)
+                if (string.Equals(ImageExtensions[i], ext, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static bool IsOfficeDocument(string ext)
+        {
+            return ext == ".docx" || ext == ".docm" || ext == ".xlsx" || ext == ".xlsm"
+                || ext == ".pptx" || ext == ".pptm" || ext == ".odt" || ext == ".ods" || ext == ".odp";
+        }
+
+        private static bool IsPdf(string ext)
+        {
+            return ext == ".pdf";
+        }
+
+        private static bool IsUnsupportedArchive(string ext)
+        {
+            return ext == ".rar" || ext == ".7z" || ext == ".tar" || ext == ".gz" || ext == ".tgz"
+                || ext == ".bz2" || ext == ".xz" || ext == ".zst" || ext == ".cab" || ext == ".iso";
+        }
+
+        private static bool LooksLikeText(string path)
+        {
+            string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            for (int i = 0; i < TextExtensions.Length; i++)
+                if (string.Equals(TextExtensions[i], ext, StringComparison.OrdinalIgnoreCase)) return true;
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] b = new byte[4096];
+                    int n = fs.Read(b, 0, b.Length);
+                    if (n == 0) return true;
+                    if (n >= 2)
+                    {
+                        if ((b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF)) return true;
+                    }
+                    int bad = 0;
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (b[i] == 0) return false;
+                        if (b[i] < 7 || (b[i] > 13 && b[i] < 32)) bad++;
+                    }
+                    return bad * 50 < n;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static FileItem MakeItem(string path)
+        {
+            FileItem it = new FileItem();
+            it.Path = path;
+            it.Name = Path.GetFileName(path);
+            try { it.Size = new FileInfo(path).Length; } catch { it.Size = 0; }
+            it.Modified = DateTime.Now;
+            return it;
+        }
+
+        private static string DirSafe(string name)
+        {
+            if (name == null || name.Length == 0) return "файл";
+            char[] bad = Path.GetInvalidFileNameChars();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                bool ok = true;
+                for (int j = 0; j < bad.Length; j++)
+                {
+                    if (bad[j] == c) { ok = false; break; }
+                }
+                sb.Append(ok ? c : '_');
+            }
+            string s = sb.ToString().Trim();
+            if (s.Length == 0) s = "файл";
+            if (s.Length > 80) s = s.Substring(0, 80);
+            return s;
+        }
+
+        private string MakeStagingDir()
+        {
+            string root = null;
+            try
+            {
+                root = Path.Combine(WorkDir, ".slonobass", "files");
+                Directory.CreateDirectory(root);
+            }
+            catch
+            {
+                root = null;
+            }
+            if (root == null)
+            {
+                try
+                {
+                    root = Path.Combine(Path.GetTempPath(), "SlonobassAgent", "files");
+                    Directory.CreateDirectory(root);
+                }
+                catch
+                {
+                    root = null;
+                }
+            }
+            if (root == null) return "";
+            CleanOldStaging(root);
+            string dir = Path.Combine(root, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+            try { Directory.CreateDirectory(dir); } catch { return ""; }
+            return dir;
+        }
+
+        private static void CleanOldStaging(string root)
+        {
+            try
+            {
+                string[] dirs = Directory.GetDirectories(root);
+                for (int i = 0; i < dirs.Length; i++)
+                {
+                    try
+                    {
+                        if (Directory.GetLastWriteTime(dirs[i]) < DateTime.Now.AddDays(-7))
+                            Directory.Delete(dirs[i], true);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+            }
         }
 
         // ---------- produced files ----------
