@@ -89,12 +89,15 @@ namespace OpenCodeChat
         private readonly string projectsDir;
         private readonly string exePath;
         private readonly string downloadsDir;
-        private readonly string userName = "Лия";
+        // Подписи авторов в переписке: свои сообщения и ответы агента.
+        private readonly string userName = "Я";
+        private const string AgentName = "Агент";
 
         private ListBox transcript;
         private TextBox input;
         private Button detachBtn;
         private Button newChatBtn;
+        private Button importBtn;
         private Button logBtn;
         private Button profileBtn;
         private Button serviceBtn;
@@ -161,9 +164,9 @@ namespace OpenCodeChat
         // Версия программы. Сравнивается с номером в теге релиза
         // slonobass-agent-N на GitHub, чтобы кнопка «Обновить программу»
         // знала, есть ли что скачивать.
-        internal const int AppVersion = 18;
+        internal const int AppVersion = 19;
         private const string ReleasesApi =
-            "https://api.github.com/repos/magiyastraha-tech/sandfly-scripts/releases?per_page=20";
+            "https://api.github.com/repos/magiyastraha-tech/slonobass-agent/releases?per_page=20";
 
         private static readonly string[] FallbackModels = new string[]
         {
@@ -419,6 +422,15 @@ namespace OpenCodeChat
             copyBtn.AccessibleDescription = "Кладёт выделенное сообщение переписки в буфер обмена";
             copyBtn.Click += delegate { CopyLastAnswer(); };
             buttons.Controls.Add(copyBtn);
+
+            importBtn = new Button();
+            importBtn.Text = "&Импорт истории";
+            importBtn.Width = 200;
+            importBtn.Height = 28;
+            importBtn.AccessibleName = "Импорт истории";
+            importBtn.AccessibleDescription = "Ctrl+I: добавить в этот чат переписку из чата другой модели";
+            importBtn.Click += delegate { TriggerImport(); };
+            buttons.Controls.Add(importBtn);
 
             main.Controls.Add(buttons, 0, 4);
 
@@ -844,6 +856,7 @@ namespace OpenCodeChat
                     body = part.Substring(nl + 1).TrimEnd('\r', '\n');
                 }
                 if (header.Length == 0 && body.Length == 0) continue;
+                header = NormalizeHeader(header);
                 body = body.Replace("\r\n", "\n").Replace("\n", "\r\n");
                 res.Add(new MessageItem(header, body, HeaderColorFor(header)));
             }
@@ -889,6 +902,8 @@ namespace OpenCodeChat
                 counts.Add(n);
                 paths.Add(text);
             }
+            Log.Write("IMPORT", "Чатов с историей помимо текущего: " + sources.Count.ToString()
+                + " (текущая модель: " + (currentModelKey.Length > 0 ? currentModelKey : "(нет)") + ").");
             if (sources.Count == 0)
             {
                 statusLabel.Text = "Других чатов с историей нет.";
@@ -999,7 +1014,7 @@ namespace OpenCodeChat
                     lineEnd = lineEnd < 0 ? t.Length : lineEnd + 1;
                     int to = i + 1 < starts.Count ? starts[i + 1] : t.Length;
                     string body = t.Substring(lineEnd, Math.Max(0, to - lineEnd)).Trim('\r', '\n', ' ');
-                    AddMessage(headers[i], body);
+                    AddMessage(NormalizeHeader(headers[i]), body);
                 }
             }
         }
@@ -1020,9 +1035,26 @@ namespace OpenCodeChat
             input.Focus();
         }
 
+        // Старые записи переписки хранят прежние подписи: «Лия» и
+        // «Slonobass agent · модель». Показываем их как «Я» и «Агент»,
+        // чтобы история выглядела одинаково с новыми сообщениями.
+        private static string NormalizeHeader(string header)
+        {
+            if (header == null || header.Length == 0) return header;
+            if (header.StartsWith("Лия", StringComparison.Ordinal)
+                && (header.Length == 3 || header[3] == ',' || header[3] == ' '))
+                return "Я" + header.Substring(3);
+            if (header.StartsWith("Slonobass agent", StringComparison.Ordinal))
+            {
+                int comma = header.LastIndexOf(',');
+                return comma > 0 ? AgentName + header.Substring(comma) : AgentName;
+            }
+            return header;
+        }
+
         private static Color HeaderColorFor(string header)
         {
-            if (header.StartsWith("Slonobass agent", StringComparison.Ordinal))
+            if (header.StartsWith(AgentName, StringComparison.Ordinal))
                 return Color.FromArgb(0x1F, 0x55, 0x9E);
             if (header.StartsWith("Файлы от агента", StringComparison.Ordinal))
                 return Color.FromArgb(0x7A, 0x4A, 0x00);
@@ -1344,6 +1376,33 @@ namespace OpenCodeChat
 
         // ---------- hotkeys ----------
 
+        // Ctrl+I ловим на уровне формы, раньше поля ввода: в части раскладок
+        // и под программами экранного доступа сочетание доходит как Ctrl+Tab
+        // (оба дают символ табуляции), и до KeyDown оно уже не добирается.
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            bool ctrl = (keyData & Keys.Control) == Keys.Control;
+            bool altShift = (keyData & (Keys.Alt | Keys.Shift)) != Keys.None;
+            Keys code = keyData & Keys.KeyCode;
+            if (ctrl && !altShift && (code == Keys.I || code == Keys.Tab))
+            {
+                TriggerImport();
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private void TriggerImport()
+        {
+            Log.Write("HOTKEY", "Нажато Ctrl+I: импорт истории.");
+            if (busy)
+            {
+                statusLabel.Text = "Сейчас идёт ответ. Импорт — после ответа.";
+                return;
+            }
+            ImportHistory();
+        }
+
         private void FormKeyDown(object sender, KeyEventArgs e)
         {
             if (e.KeyCode == Keys.Escape && busy)
@@ -1386,12 +1445,7 @@ namespace OpenCodeChat
             {
                 e.Handled = true;
                 e.SuppressKeyPress = true;
-                if (busy)
-                {
-                    statusLabel.Text = "Сейчас идёт ответ. Импорт — после ответа.";
-                    return;
-                }
-                ImportHistory();
+                TriggerImport();
             }
             else if (e.Alt && e.KeyCode == Keys.F)
             {
@@ -1812,13 +1866,7 @@ namespace OpenCodeChat
             lastAnswer = answerText;
 
             int answerIndex = messages.Count;
-            string who = "Slonobass agent";
-            if (model.Length > 0)
-            {
-                int slash = model.IndexOf('/');
-                who += " · " + (slash >= 0 ? model.Substring(slash + 1) : model);
-            }
-            AppendBlock(who + ", " + time, answerText, Color.FromArgb(0x1F, 0x55, 0x9E));
+            AppendBlock(AgentName + ", " + time, answerText, Color.FromArgb(0x1F, 0x55, 0x9E));
 
             if (produced.Count > 0)
             {
@@ -1853,6 +1901,7 @@ namespace OpenCodeChat
             busy = value;
             detachBtn.Enabled = !value && pending.Count > 0;
             newChatBtn.Enabled = !value;
+            if (importBtn != null) importBtn.Enabled = !value;
             if (stopBtn != null) stopBtn.Enabled = value;
             // Выбор модели не отключаем: отключённый элемент экранный диктор
             // пропускает, и кажется, что список моделей исчез.
